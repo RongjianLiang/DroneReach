@@ -22,7 +22,7 @@ class DroneReachDiscrete(gym.Env):
                  num_buildings: int = 10,
                  num_obstacles: int = 10,
                  step_goal_every: int = 5,
-                 reach_threshold: int = 3,
+                 reach_threshold: int = 5,
                  binary_env: bool = False,
                  if_hetero_reward: bool = True,
                  ground_prox_penalty: float = 0.2,
@@ -34,6 +34,7 @@ class DroneReachDiscrete(gym.Env):
                  ):
         # environment information
 
+        self.collision_penalty_queue = [0.]
         self.step_goal_every = step_goal_every
         self.reach_threshold = reach_threshold
         self.size = size  # the size of our environment
@@ -81,11 +82,11 @@ class DroneReachDiscrete(gym.Env):
 
         # other info for debugging
         self.path = [self.agent[0].get_location()]
-        self.collision_flag = False
         self.episode_step = 0
-        # self.obstacle_all_pos = {}
-        # self.obstacle_eps_pos = {}
-        # self.obs_curr_loc = []
+        self.reach_reward_queue = [0.]
+        self.move_penalty_queue = [0.]
+        self.borders_penalty_queue = [0.]
+        self.resolved_cost_queue = [0.]
 
     def _generate_envs(self):
         """
@@ -148,24 +149,31 @@ class DroneReachDiscrete(gym.Env):
     def _get_obs(self):
         goal_in = self.agent[0].get_location() - self.agent[0].get_location()
         observation = {"agent": self.agent[0].get_location(),
+                       "buildings_map": self.terrain_map,
                        "goal": goal_in,
-                       "obstacles_map": self.obstacles_map,
-                       "buildings_map": self.terrain_map
+                       "obstacles_map": self.obstacles_map
                        }
         return observation
 
     def _get_info(self):
-        info = {}
+        info = {"current step:": self.episode_step,
+                "collision penalty": self.collision_penalty_queue[-1],
+                "reach reward:": self.reach_reward_queue[-1],
+                "move penalty:": self.move_penalty_queue[-1],
+                "borders penalty:": self.borders_penalty_queue[-1],
+                "resolve cost:": self.resolved_cost_queue[-1]
+                }
         # getting info on agent's collision
-        if self.collision_flag:
-            info["agent collision step"] = self.episode_step
+        # if self.collision_flag:
+        #     info["agent collision step"] = self.episode_step
         # getting info on obstacle's position
-        obs_id = 0
-        obs_curr_loc = {}
-        for obs in self.obstacles_list:
-            obs_curr_loc[f"obstacle_{obs_id}"] = obs.get_location()
-            obs_id += 1
-        info["obstacle location"] = obs_curr_loc
+        # obs_id = 0
+        # obs_curr_loc = {}
+        # for obs in self.obstacles_list:
+        #     obs_curr_loc[f"obstacle_{obs_id}"] = obs.get_location()
+        #     obs_id += 1
+        # info["obstacle location"] = obs_curr_loc
+
         return info
 
     def _empty_blocks(self, occupied):
@@ -201,7 +209,6 @@ class DroneReachDiscrete(gym.Env):
             print(f"creating dir: {self.env_eps_img_dir}\n")
             # try:
             os.mkdir(self.env_eps_img_dir)
-        # except FileExistsError:
 
         self.path = [self.agent[0].get_location()]
         obs = self._get_obs()
@@ -382,7 +389,7 @@ class DroneReachDiscrete(gym.Env):
         if self.episode_step % self.step_goal_every == 0:
             goal_loc = self._step_goal(terrain_bool_map)
         else:
-            goal_loc = self.agent[0].get_location()
+            goal_loc = self.agent[1].get_location()
 
         curr_loc = self.agent[0].get_location()
 
@@ -401,11 +408,20 @@ class DroneReachDiscrete(gym.Env):
             next_loc = curr_loc
             run_into_border = True
 
-        discrete_steps = np.absolute(next_loc, goal_loc)
+        discrete_steps = np.absolute(next_loc - goal_loc)
+        # print(f"curr_loc: {curr_loc}, goal_loc: {goal_loc}")
+        # print(f"--d-steps: {discrete_steps}, threshold: {self.reach_threshold} , "
+        #       f"if reached: {discrete_steps.sum() <= self.reach_threshold}")
         reach_reward = self.calc_reach_stray_reward(discrete_steps)
         reward = reach_reward - self.move_penalty - \
                  collision * self.collision_penalty - \
                  run_into_border * self.borders_penalty - resolved * self.resolve_cost
+
+        self.reach_reward_queue.append(reach_reward)
+        self.move_penalty_queue.append(self.move_penalty)
+        self.borders_penalty_queue.append(run_into_border * self.borders_penalty)
+        self.resolved_cost_queue.append(resolved*self.resolve_cost)
+        self.collision_penalty_queue.append(collision * self.collision_penalty)
 
         observation = self._get_obs()
         info = self._get_info()
