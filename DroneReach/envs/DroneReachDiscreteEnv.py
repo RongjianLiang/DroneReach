@@ -13,7 +13,7 @@ class DroneReachDiscrete(gym.Env):
     """
 
     """
-    metadata = {"render_modes": ['save']}
+    metadata = {"render_modes": ['human', 'save']}
 
     def __init__(self,
                  render_mode=None,
@@ -21,17 +21,21 @@ class DroneReachDiscrete(gym.Env):
                  size: int = 10,
                  num_buildings: int = 10,
                  num_obstacles: int = 10,
-                 max_episode_step: int = 50,
+                 step_goal_every: int = 5,
+                 reach_threshold: int = 3,
                  binary_env: bool = False,
                  if_hetero_reward: bool = True,
                  ground_prox_penalty: float = 0.2,
                  collision_penalty: float = 0.25,
+                 borders_penalty: float = 0.3,
                  move_penalty: float = 0.01,
-                 goal_reward: float = 1.00,
+                 resolve_cost: float = 0.5,
+                 goal_prox_reward: float = 0.8
                  ):
         # environment information
 
-        self.max_episode_step = max_episode_step
+        self.step_goal_every = step_goal_every
+        self.reach_threshold = reach_threshold
         self.size = size  # the size of our environment
         self.max_flight_height = size - 2
         self.num_buildings = num_buildings
@@ -51,8 +55,10 @@ class DroneReachDiscrete(gym.Env):
         self.if_hetero_reward = if_hetero_reward
         self.ground_prox_penalty = ground_prox_penalty
         self.collision_penalty = collision_penalty
+        self.borders_penalty = borders_penalty
         self.move_penalty = move_penalty
-        self.goal_reward = goal_reward
+        self.resolve_cost = resolve_cost
+        self.goal_prox_reward = goal_prox_reward
 
         # create some numpy arrays expressing observation spaces
         point_loc_arr = np.full(3, size - 1, dtype=int)
@@ -140,8 +146,9 @@ class DroneReachDiscrete(gym.Env):
         return terrain
 
     def _get_obs(self):
+        goal_in = self.agent[0].get_location() - self.agent[0].get_location()
         observation = {"agent": self.agent[0].get_location(),
-                       "goal": self.agent[1].get_location(),
+                       "goal": goal_in,
                        "obstacles_map": self.obstacles_map,
                        "buildings_map": self.terrain_map
                        }
@@ -187,11 +194,11 @@ class DroneReachDiscrete(gym.Env):
         self.episode_step = 0
         self.video_frame = 0
         self.episode_number += 1
-        if self.render_mode is not None:
+        if self.render_mode == 'save':
             eps_dir = f"episode-{self.episode_number}"
-            print(f"env reset for recording..")
+            print(f"\nenv reset for recording..")
             self.env_eps_img_dir = os.path.join(self.env_img_dir, eps_dir)
-            print(f"creating dir: {self.env_eps_img_dir}")
+            print(f"creating dir: {self.env_eps_img_dir}\n")
             # try:
             os.mkdir(self.env_eps_img_dir)
         # except FileExistsError:
@@ -207,7 +214,7 @@ class DroneReachDiscrete(gym.Env):
         drones_bool_map = (self.drones_map == 1)
         return terrain_bool_map, obstacles_bool_map, drones_bool_map
 
-    def _within_bounds(self, location):
+    def agent_within_bounds(self, location):
         x, y, z = location
         return (0 <= x < self.size) and (0 <= y < self.size) and (0 <= z < self.size)
 
@@ -215,27 +222,84 @@ class DroneReachDiscrete(gym.Env):
         x, y, z = location
         return 0 <= x < self.size and 0 <= y < self.size and 0 <= z < self.size
 
+    def resolve_agent_bounce(self, t_bool_map, o_bool_map, curr_loc):
+        agent = self.agent[0]
+        valid_action = []
+        for action in range(6):
+            if self.agent_within_bounds(agent.try_action(action)):
+                valid_action.append(action)
+
+        resolve_action = []
+        for resolve in valid_action:
+            next_loc = agent.try_action(resolve)
+            if not self._check_agent_collision(t_bool_map, o_bool_map, next_loc):
+                resolve_action.append(resolve)
+
+        resolution = random.choice(resolve_action)
+        resolved_loc = agent.action(resolution, False, False)
+        self.drones_map[tuple(curr_loc)] = 0
+        self.drones_map[tuple(resolved_loc)] = 1
+        return resolution
+
     def step_drone(self, action, curr_loc, collision, t_bool_map, o_bool_map):
-        try_next_loc = self.agent[0].try_action(action, collision=collision, collision_recovery=self.if_collision_recovery)
-        if not self._within_bounds(try_next_loc):
-            next_loc = None
-            return next_loc
-        # print(f"try next loc: {try_next_loc}")
+        """
+        if drone's next trying loc is outside of bounds, simply raise the flag, return curr loc, and let the drone holds.
+        :param action: an integer between 0 and 5.
+        :param curr_loc: numpy array
+        :param collision: result of collision check between obstacles.
+        :param t_bool_map: as is.
+        :param o_bool_map: as is
+        :return: next location after stepping, and a flag for if resolve routine is used.
+        """
+        try_next_loc = self.agent[0].try_action(action, collision=collision,
+                                                collision_recovery=self.if_collision_recovery)
+        if not self.agent_within_bounds(try_next_loc):
+            # the bouncing get agent out of bound...
+            # calling more advanced method to revolve the bounced direction...
+            # we can not step obstacles now...
+            # and this move is hold...how about assign a resolve cost?
+            next_loc = self.resolve_agent_bounce(t_bool_map, o_bool_map, curr_loc)
+            return next_loc, True
+        # print(f"step, trying next loc: {try_next_loc}")
         if self._check_agent_collision(t_bool_map, o_bool_map, try_next_loc):
-            # the next location is still in collision
-            # cancel the move?
-            # print("second collision: stuck...")
             next_loc = curr_loc
         else:
-            # print("no collision, proceed!")
             self.agent[0].action(action, collision=collision, collision_recovery=self.if_collision_recovery)
             next_loc = try_next_loc
-        # print(f"curr loc: {curr_loc}")
-        # print(f"next loc: {next_loc}")
+        # print(f"the next loc is {next_loc}")
         self.drones_map[tuple(curr_loc)] = 0
         self.drones_map[tuple(next_loc)] = 1
         self.path.append(next_loc)
-        return next_loc
+        return next_loc, False
+
+    def _step_goal(self, terrain_bool_map):
+        """
+        drift the goal to a valid and correct but random position.
+        :param terrain_bool_map: as is.
+        :return: goal next location.
+        """
+        goal = self.agent[1]
+        curr_loc = goal.get_location()
+        # print(f"goal curr loc: {curr_loc}")
+        valid_drift = []
+        for choice in range(6):
+            if self.obs_within_bounds(goal.try_drift(choice)):
+                valid_drift.append(choice)
+        # and we do not want the goal to drift inside the buildings!
+        # as for obstacles...the influence should be small.
+        correct_drift = []
+        for pos_choice in valid_drift:
+            next_loc = goal.try_drift(pos_choice)
+            if not terrain_bool_map.astype(int)[tuple(next_loc)]:
+                correct_drift.append(pos_choice)
+
+        # sample the random drift
+        action = random.choice(correct_drift)
+        next_goal_loc = goal.action(action, False, False)
+        # print(f"goal drifting to {next_goal_loc}")
+        self.goals_map[tuple(curr_loc)] = 0
+        self.goals_map[tuple(next_goal_loc)] = 1
+        return next_goal_loc
 
     def _step_obstacles(self, terrain_bool_map):
         """implement the stepping obstacles logic,
@@ -285,13 +349,13 @@ class DroneReachDiscrete(gym.Env):
 
     def _check_agent_collision(self, terrain_bool_map, obstacles_bool_map, next_loc):
         """
-        Given current bool maps, determine given position could lead to a collision with buildings
-         and obstacles.
+        Given current bool maps, determine given position could lead to a collision with buildings, obstacles.
         :param terrain_bool_map:
         :param obstacles_bool_map:
         :return: result of collision check
         """
         result = False
+        # TODO: need to check borders before accessing the map
         collision_bitmap = (terrain_bool_map | obstacles_bool_map).astype(int)
         if collision_bitmap[tuple(next_loc)] == 1:
             result = True
@@ -307,39 +371,41 @@ class DroneReachDiscrete(gym.Env):
         truncated = False
         reach = False
         collision = False
+        run_into_border = False
+        resolved = False
 
         # step the obstacles first
         terrain_bool_map = (self.terrain_map == 1)
         self._step_obstacles(terrain_bool_map)
         terrain_bool_map, obstacles_bool_map, drones_bool_map = self._generate_bool_map()
 
+        if self.episode_step % self.step_goal_every == 0:
+            goal_loc = self._step_goal(terrain_bool_map)
+        else:
+            goal_loc = self.agent[0].get_location()
+
         curr_loc = self.agent[0].get_location()
-        next_loc = None
 
-        if all(np.equal(self.agent[0].get_location(), self.agent[1].get_location())):
-            reach = True
-            terminated = True
+        next_original_pos = self.agent[0].try_action(action)
 
+        # First check if within
+        within = self.agent_within_bounds(next_original_pos)
+        if within:
+            # print(f"given curr_loc: {curr_loc}, and next org loc: {next_original_pos}, action is {action}")
+            collision = self._check_agent_collision(terrain_bool_map, obstacles_bool_map, next_original_pos)
+            next_loc, resolved = self.step_drone(action, curr_loc, collision, t_bool_map=terrain_bool_map,
+                                                 o_bool_map=obstacles_bool_map)
         else:
-            next_original_pos = self.agent[0].try_action(action)
-            within = self._within_bounds(next_original_pos)
-            if not within:
-                truncated = True
-            else:
-                collision = self._check_agent_collision(terrain_bool_map, obstacles_bool_map, next_original_pos)
-                next_loc = self.step_drone(action, curr_loc, collision,
-                                           t_bool_map=terrain_bool_map, o_bool_map=obstacles_bool_map)
-                if next_loc is None:
-                    truncated = True
+            # print(f"not within bounds! you are at {curr_loc}, trying to move to {next_original_pos}")
+            """Agent would remain current pos if next pos not within"""
+            next_loc = curr_loc
+            run_into_border = True
 
-        # Calculate the rewards
-        if truncated:
-            reward = -1
-        elif reach:
-            reward = self.goal_reward
-        else:
-            hetero_reward = (self.if_hetero_reward * 2 * self.terrain_map[tuple(next_loc)])
-            reward = (-self.move_penalty) * (1.0 + hetero_reward) - collision * self.collision_penalty
+        discrete_steps = np.absolute(next_loc, goal_loc)
+        reach_reward = self.calc_reach_stray_reward(discrete_steps)
+        reward = reach_reward - self.move_penalty - \
+                 collision * self.collision_penalty - \
+                 run_into_border * self.borders_penalty - resolved * self.resolve_cost
 
         observation = self._get_obs()
         info = self._get_info()
@@ -348,7 +414,21 @@ class DroneReachDiscrete(gym.Env):
 
         if self.render_mode == 'save':
             self.render()
+
         return observation, reward, terminated, truncated, info
+
+    def calc_reach_stray_reward(self, steps_to_goal):
+        """
+        :param steps_to_goal: A 3D numpy array, for number of steps at x, y, z to reach goal location.
+        :return: calculated rewards
+        """
+        steps_threshold = self.reach_threshold
+        total_steps = steps_to_goal.sum()
+        if total_steps <= steps_threshold:
+            reward = self.goal_prox_reward  # we need to cover the cost of moving towards target somehow...
+        else:
+            reward = 0
+        return reward
 
     def render(self):
 
@@ -384,6 +464,8 @@ class DroneReachDiscrete(gym.Env):
             plt.savefig(image_path, format='png')
             plt.close()
             return
+        elif self.render_mode == 'human':
+            plt.show()
         else:
             pass
 
