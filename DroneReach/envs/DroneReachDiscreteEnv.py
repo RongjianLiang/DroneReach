@@ -1,0 +1,391 @@
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import random
+import os
+
+from DroneReach.utils.Point import Point
+
+
+class DroneReachDiscrete(gym.Env):
+    """
+
+    """
+    metadata = {"render_modes": ['save']}
+
+    def __init__(self,
+                 render_mode=None,
+                 env_img_dir=None,
+                 size: int = 10,
+                 num_buildings: int = 10,
+                 num_obstacles: int = 10,
+                 max_episode_step: int = 50,
+                 binary_env: bool = False,
+                 if_hetero_reward: bool = True,
+                 ground_prox_penalty: float = 0.2,
+                 collision_penalty: float = 0.25,
+                 move_penalty: float = 0.01,
+                 goal_reward: float = 1.00,
+                 ):
+        # environment information
+
+        self.max_episode_step = max_episode_step
+        self.size = size  # the size of our environment
+        self.max_flight_height = size - 2
+        self.num_buildings = num_buildings
+        self.num_obstacles = num_obstacles
+        self.if_collision_recovery = True
+
+        # rendering
+        # print("init env...episode number cleared")
+        self.render_mode = render_mode
+        self.env_img_dir = env_img_dir
+        self.env_eps_img_dir = ""
+        self.video_frame = 0
+        self.episode_number = 0
+
+        # rewards configuration
+        self.binary_env = binary_env
+        self.if_hetero_reward = if_hetero_reward
+        self.ground_prox_penalty = ground_prox_penalty
+        self.collision_penalty = collision_penalty
+        self.move_penalty = move_penalty
+        self.goal_reward = goal_reward
+
+        # create some numpy arrays expressing observation spaces
+        point_loc_arr = np.full(3, size - 1, dtype=int)
+        obstacles_loc_arr = np.full((size, size, size), 1, dtype=int)
+        buildings_loc_arr = np.full((size, size, size), 1, dtype=int)
+
+        # creating envs
+
+        self.observation_space = spaces.Dict(
+            {
+                "agent": spaces.MultiDiscrete(point_loc_arr),
+                "goal": spaces.MultiDiscrete(point_loc_arr),
+                "obstacles_map": spaces.MultiDiscrete(obstacles_loc_arr),
+                "buildings_map": spaces.MultiDiscrete(buildings_loc_arr)
+            }
+        )
+        self._generate_envs()
+
+        self.action_space = spaces.Discrete(6)
+
+        # other info for debugging
+        self.path = [self.agent[0].get_location()]
+        self.collision_flag = False
+        self.episode_step = 0
+        # self.obstacle_all_pos = {}
+        # self.obstacle_eps_pos = {}
+        # self.obs_curr_loc = []
+
+    def _generate_envs(self):
+        """
+        A function to regenerate the terrains, obstacles, agent, and goal.
+        \n 1. Generate terrain map and pass it to attribute.
+        \n 2. Generate agent by emtpy blocks iterator.
+        \n 3. Generate drones map the contains the agent's location.
+        \n 4. Generate goals map that contains goals position.
+        \n 5. Generate ...
+        :return:
+        """
+        size = self.size
+        self.terrain_map = self.generate_terrain(size)
+        empty_blocks_iter = self._empty_blocks(self.terrain_map)
+        self.agent = [Point(*next(empty_blocks_iter)), Point(*next(empty_blocks_iter))]
+        self.drones_map = np.zeros((size, size, size), dtype=int)
+        self.goals_map = np.zeros((size, size, size), dtype=int)
+        self.obstacles_map = np.zeros((size, size, size), dtype=int)
+
+        self.drones_map[tuple(self.agent[0].get_location())] = 1
+        self.goals_map[tuple(self.agent[1].get_location())] = 1
+        self.obstacles_list = [Point(*next(empty_blocks_iter)) for i in range(self.num_obstacles)]
+        # for obs in self.obstacles_list:
+        #     self.obs_curr_loc.append(obs.get_location())
+
+        # create new dict to store transitions
+        # add this dict to all dict
+        # self.obstacle_eps_pos = {}
+        # self.obstacle_all_pos[f"episode_{self.episode_number}"] = self.obstacle_eps_pos
+        # obs_id = 0
+        # for obs in self.obstacles_list:
+        #     self.obstacles_map[tuple(obs.get_location())] = 1
+        #     self.obstacle_eps_pos[f"obstacle_{obs_id}"] = list(obs.get_location())
+        #     obs_id += 1
+
+    def generate_terrain(self, size):
+        terrain = np.zeros((size, size, size), dtype=int)
+
+        if self.ground_prox_penalty and not self.binary_env:
+            for i in range(size // 2):
+                terrain[:, :, i] = self.ground_prox_penalty * (size // 2 - i) / (size // 2)
+
+        for i in range(self.num_buildings):
+            while True:
+                # Generate random numbers in intervals of 0.5
+                x, y = np.random.randint(0, size * 2, 2) / 2
+                # Generate random building height
+                z = np.random.randint(0, self.max_flight_height)
+                # Check if existing buildings exist. If so, regenerate. Otherwise, keep building.
+                if np.all(terrain[math.floor(x):math.ceil(x) + 1, math.floor(y):math.ceil(y) + 1, 0:z] != 1):
+                    if not self.binary_env:
+                        terrain[math.floor(x) - 1:math.ceil(x) + 2, math.floor(y) - 1:math.ceil(y) + 2, 0:z + 1] \
+                            = terrain[math.floor(x) - 1:math.ceil(x) + 2, math.floor(y) - 1:math.ceil(y) + 2, 0:z + 1] \
+                            .clip(min=0.5)
+                    terrain[math.floor(x):math.ceil(x) + 1, math.floor(y):math.ceil(y) + 1, 0:z].fill(1)
+                    break
+
+        return terrain
+
+    def _get_obs(self):
+        observation = {"agent": self.agent[0].get_location(),
+                       "goal": self.agent[1].get_location(),
+                       "obstacles_map": self.obstacles_map,
+                       "buildings_map": self.terrain_map
+                       }
+        return observation
+
+    def _get_info(self):
+        info = {}
+        # getting info on agent's collision
+        if self.collision_flag:
+            info["agent collision step"] = self.episode_step
+        # getting info on obstacle's position
+        obs_id = 0
+        obs_curr_loc = {}
+        for obs in self.obstacles_list:
+            obs_curr_loc[f"obstacle_{obs_id}"] = obs.get_location()
+            obs_id += 1
+        info["obstacle location"] = obs_curr_loc
+        return info
+
+    def _empty_blocks(self, occupied):
+        """
+        Return an iterator of empty blocks (represented by np.array([x, y, z])).
+        :param occupied: a 3-D numpy array-like bitmap indicating which position are occupied
+        :return: an iterator on empty blocks
+        """
+        empty_blocks = [np.array([x, y, z])
+                        for x in range(self.size)
+                        for y in range(self.size)
+                        for z in range(self.size) if
+                        occupied[x, y, z] != 1]
+        random.shuffle(empty_blocks)
+        return iter(empty_blocks)
+
+    # TODO: fix reset function
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        # Reset the terrain map
+        self._generate_envs()
+
+        # Reset the other variable
+        # self.steps_of_agent_collision = []
+        self.episode_step = 0
+        self.video_frame = 0
+        self.episode_number += 1
+        if self.render_mode is not None:
+            eps_dir = f"episode-{self.episode_number}"
+            print(f"env reset for recording..")
+            self.env_eps_img_dir = os.path.join(self.env_img_dir, eps_dir)
+            print(f"creating dir: {self.env_eps_img_dir}")
+            # try:
+            os.mkdir(self.env_eps_img_dir)
+        # except FileExistsError:
+
+        self.path = [self.agent[0].get_location()]
+        obs = self._get_obs()
+        info = self._get_info()
+        return obs, info
+
+    def _generate_bool_map(self):
+        terrain_bool_map = (self.terrain_map == 1)
+        obstacles_bool_map = (self.obstacles_map == 1)
+        drones_bool_map = (self.drones_map == 1)
+        return terrain_bool_map, obstacles_bool_map, drones_bool_map
+
+    def _within_bounds(self, location):
+        x, y, z = location
+        return (0 <= x < self.size) and (0 <= y < self.size) and (0 <= z < self.size)
+
+    def obs_within_bounds(self, location):
+        x, y, z = location
+        return 0 <= x < self.size and 0 <= y < self.size and 0 <= z < self.size
+
+    def step_drone(self, action, curr_loc, collision, t_bool_map, o_bool_map):
+        try_next_loc = self.agent[0].try_action(action, collision=collision, collision_recovery=self.if_collision_recovery)
+        if not self._within_bounds(try_next_loc):
+            next_loc = None
+            return next_loc
+        # print(f"try next loc: {try_next_loc}")
+        if self._check_agent_collision(t_bool_map, o_bool_map, try_next_loc):
+            # the next location is still in collision
+            # cancel the move?
+            # print("second collision: stuck...")
+            next_loc = curr_loc
+        else:
+            # print("no collision, proceed!")
+            self.agent[0].action(action, collision=collision, collision_recovery=self.if_collision_recovery)
+            next_loc = try_next_loc
+        # print(f"curr loc: {curr_loc}")
+        # print(f"next loc: {next_loc}")
+        self.drones_map[tuple(curr_loc)] = 0
+        self.drones_map[tuple(next_loc)] = 1
+        self.path.append(next_loc)
+        return next_loc
+
+    def _step_obstacles(self, terrain_bool_map):
+        """implement the stepping obstacles logic,
+        and obstacles are step-able just like agent does.
+        Collision is not checked between obstacles.
+        When hit the bounds, a naive re-spawning is done.
+        :return: none.
+        """
+        obs_id = 0
+        for obs in self.obstacles_list:
+            curr_loc = obs.get_location()
+            self.obstacles_map[tuple(curr_loc)] = 0
+
+            next_original_loc = obs.try_drift()
+
+            # checking all possible next loc
+            valid_choice = []
+            for choice in range(6):
+                if self.obs_within_bounds(obs.try_drift(choice)):
+                    # print(f"-- obs: id {obs_id} valid next loc{obs.try_drift(choice)}")
+                    valid_choice.append(choice)
+                # then check for buildings
+            correct_choice = []
+            for pos_choice in valid_choice:
+                next_loc = obs.try_drift(pos_choice)
+                if not terrain_bool_map.astype(int)[tuple(next_loc)]:
+                    correct_choice.append(pos_choice)
+                    # print(f"** obs: id {obs_id} correct next loc{obs.try_drift(pos_choice)}")
+
+            # determine if the original choice is correct
+            change = True
+            # print(f"++ obs: id {obs_id} all correct move: {correct_choice}")
+            for i in correct_choice:
+                # print(f"this is fine: {obs.try_drift(i)}")
+                if all(np.equal(next_original_loc, obs.try_drift(i))):
+                    # print(f"we have: {obs.try_drift(i)} equal to {next_original_loc}")
+                    change = False
+
+            if change:
+                action = random.choice(correct_choice)
+                next_loc = obs.drift(action)
+            else:
+                next_loc = obs.drift()
+
+            obs_id += 1
+            self.obstacles_map[tuple(next_loc)] = 1
+
+    def _check_agent_collision(self, terrain_bool_map, obstacles_bool_map, next_loc):
+        """
+        Given current bool maps, determine given position could lead to a collision with buildings
+         and obstacles.
+        :param terrain_bool_map:
+        :param obstacles_bool_map:
+        :return: result of collision check
+        """
+        result = False
+        collision_bitmap = (terrain_bool_map | obstacles_bool_map).astype(int)
+        if collision_bitmap[tuple(next_loc)] == 1:
+            result = True
+            self.collision_flag = True
+        return result
+
+    def step(self, action):
+        """
+        """
+        # -> Tuple[ObsType, SupportsFloat, bool, bool, Dict[str, Any]]
+        self.episode_step += 1
+        terminated = False
+        truncated = False
+        reach = False
+        collision = False
+
+        # step the obstacles first
+        terrain_bool_map = (self.terrain_map == 1)
+        self._step_obstacles(terrain_bool_map)
+        terrain_bool_map, obstacles_bool_map, drones_bool_map = self._generate_bool_map()
+
+        curr_loc = self.agent[0].get_location()
+        next_loc = None
+
+        if all(np.equal(self.agent[0].get_location(), self.agent[1].get_location())):
+            reach = True
+            terminated = True
+
+        else:
+            next_original_pos = self.agent[0].try_action(action)
+            within = self._within_bounds(next_original_pos)
+            if not within:
+                truncated = True
+            else:
+                collision = self._check_agent_collision(terrain_bool_map, obstacles_bool_map, next_original_pos)
+                next_loc = self.step_drone(action, curr_loc, collision,
+                                           t_bool_map=terrain_bool_map, o_bool_map=obstacles_bool_map)
+                if next_loc is None:
+                    truncated = True
+
+        # Calculate the rewards
+        if truncated:
+            reward = -1
+        elif reach:
+            reward = self.goal_reward
+        else:
+            hetero_reward = (self.if_hetero_reward * 2 * self.terrain_map[tuple(next_loc)])
+            reward = (-self.move_penalty) * (1.0 + hetero_reward) - collision * self.collision_penalty
+
+        observation = self._get_obs()
+        info = self._get_info()
+
+        self.video_frame += 1
+
+        if self.render_mode == 'save':
+            self.render()
+        return observation, reward, terminated, truncated, info
+
+    def render(self):
+
+        elev = 60
+        azim = 45
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(projection='3d')
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        ax.view_init(elev=elev, azim=azim)
+        ax.grid(True)
+
+        terrain = self.terrain_map == 1
+        drones = self.drones_map == 1
+        goals = self.goals_map == 1
+        obstacles = self.obstacles_map == 1
+
+        voxel_arr = terrain | drones | goals | obstacles
+        colors = np.empty(terrain.shape, dtype=object)
+        colors[terrain] = '#7A88CCC0'
+        colors[drones] = '#FFD65DC0'
+        colors[goals] = '#607D3BC0'
+        colors[obstacles] = '#FDA4BAC0'
+        ax.voxels(voxel_arr, facecolors=colors, shade=True)
+        if self.render_mode is 'save':
+            # par_dir = self.env_eps_img_dir
+            # image_name = f"-{self.episode_number}"
+            # image_path = os.path.join(par_dir, image_name)
+            par_dir = self.env_eps_img_dir
+            image_name = f"{self.video_frame}.png"
+            image_path = os.path.join(par_dir, image_name)
+            plt.savefig(image_path, format='png')
+            plt.close()
+            return
+        else:
+            pass
+
+    def close(self):
+        pass
