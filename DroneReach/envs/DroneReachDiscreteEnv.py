@@ -374,7 +374,7 @@ class DroneReachDiscrete(gym.Env):
         colors[goals] = '#607D3BC0'
         colors[obstacles] = '#FDA4BAC0'
         ax.voxels(voxel_arr, facecolors=colors, shade=True)
-        if self.render_mode is 'save':
+        if self.render_mode == 'save':
             # par_dir = self.env_eps_img_dir
             # image_name = f"-{self.episode_number}"
             # image_path = os.path.join(par_dir, image_name)
